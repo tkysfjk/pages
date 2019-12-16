@@ -1,0 +1,175 @@
+version: 2.1
+jobs:
+
+  test_and_upload:
+    # Specify the Xcode version to use
+    macos:
+      xcode: "11.2.1"
+
+    parameters:
+      scheme:
+        description: Xcode project scheme to be used.
+        type: enum
+        default: "yamap"
+        enum: ["yamap", "yamap (develop)", "yamap (staging)", "yamap (IAP develop)"]
+
+      skip_test:
+        description: true if test is to be skipped.
+        type: boolean
+        default: false
+
+      skip_upload:
+        description: true if upload to testflight is to be skipped.
+        type: boolean
+        default: true
+
+      marketing_version:
+        description: CFBundleShortVersionString. If set, marketing version is overriden by this value.
+        type: string
+        default: ""
+
+      bundle_version:
+        description: CFBundleVersion. If set, bundle version is overriden by this value.
+        type: string
+        default: ""
+
+    steps:
+
+      - run:
+          name: Checkout source code
+          command: |
+            git clone --depth=1 --branch $CIRCLE_BRANCH --single-branch $CIRCLE_REPOSITORY_URL .
+            git reset --hard $CIRCLE_SHA1 || (echo "branch was updated after build !!" 1>&2; false)
+
+      - run: xcodebuild -version > "xcodeversion"
+
+      - restore_cache:
+          keys:
+            - cocoapods-cache-{{ checksum "xcodeversion" }}-{{ .Environment.YAMAP_COCOAPODS_CACHE_KEY }}-{{ checksum "Podfile.lock" }}
+            - cocoapods-cache-{{ checksum "xcodeversion" }}-{{ .Environment.YAMAP_COCOAPODS_CACHE_KEY }}-
+
+      - run:
+          name: Install CocoaPods
+          command: |
+            curl -Ss https://cocoapods-specs.circleci.com/fetch-cocoapods-repo-from-s3.sh | bash
+            pod install
+
+      - save_cache:
+          key: cocoapods-cache-{{ checksum "xcodeversion" }}-{{ .Environment.YAMAP_COCOAPODS_CACHE_KEY }}-{{ checksum "Podfile.lock" }}
+          paths:
+            - "Pods"
+
+      - restore_cache:
+          keys:
+            - carthage-cache-{{ checksum "xcodeversion" }}-{{ .Environment.YAMAP_CARTHAGE_CACHE_KEY }}-{{ checksum "Cartfile.resolved" }}
+            - carthage-cache-{{ checksum "xcodeversion" }}-{{ .Environment.YAMAP_CARTHAGE_CACHE_KEY }}-
+
+      - run:
+          name: Install Carthage
+          command: |
+            carthage version
+            carthage bootstrap --platform ios --cache-builds
+
+      - save_cache:
+          key: carthage-cache-{{ checksum "xcodeversion" }}-{{ .Environment.YAMAP_CARTHAGE_CACHE_KEY }}-{{ checksum "Cartfile.resolved" }}
+          paths:
+            - "Carthage"
+
+      - restore_cache:
+          key: gems-cache-{{ checksum "Gemfile.lock" }}
+
+      - run: bundle check || bundle install --path vendor/bundle
+
+      - save_cache:
+          key: gems-cache-{{ checksum "Gemfile.lock" }}
+          paths:
+            - vendor/bundle
+
+      - run:
+          name: Prefix to version.
+          command: |
+            if [ -n "<< parameters.marketing_version >>" ]; then \
+              agvtool new-marketing-version "<< parameters.marketing_version >>"; \
+            fi; \
+            if [ -n "<< parameters.bundle_version >>" ]; then \
+              agvtool new-version -all "<< parameters.bundle_version >>"; \
+            fi
+
+      - run:
+          name: Upload archive via fastlane
+          no_output_timeout: 30m
+          command: |
+            bundle exec fastlane test_and_upload scheme:"<< parameters.scheme >>" skip_test:<< parameters.skip_test >> skip_upload:<< parameters.skip_upload >>
+
+workflows:
+  yamap_release:
+    jobs:
+      - test_and_upload: &YAMAP_RELEASE_COMMON
+          name: "YAMAP Release"
+          scheme: "yamap"
+          skip_upload: false
+          filters:
+            branches:
+              only:
+                - /^release\/\d+\.\d+\.\d+/
+
+      - test_and_upload:
+          <<: *YAMAP_RELEASE_COMMON
+          name: "YAMAP (develop) Release"
+          scheme: "yamap (develop)"
+          skip_test: true
+
+      - test_and_upload:
+          <<: *YAMAP_RELEASE_COMMON
+          marketing_version: "997.$(basename \"${CIRCLE_PULL_REQUESTS}\")"
+          bundle_version: "${CIRCLE_BUILD_NUM}"
+          name: "YAMAP (IAP) Release"
+          scheme: "yamap (IAP develop)"
+          skip_test: true
+
+      - test_and_upload:
+          <<: *YAMAP_RELEASE_COMMON
+          marketing_version: "996.$(basename \"${CIRCLE_PULL_REQUESTS}\")"
+          bundle_version: "${CIRCLE_BUILD_NUM}"
+          name: "YAMAP (staging) Release"
+          scheme: "yamap (staging)"
+          skip_test: true
+
+  yamap_pr:
+    jobs:
+      - test_and_upload:
+          name: "YAMAP PR Verification"
+          filters:
+            branches:
+              only:
+                - /^feature\/.+/
+
+  yamap_pr_testflight:
+    jobs:
+      - test_and_upload: &YAMAP_PR_TESTFLIGHT_COMMON
+          name: "YAMAP PR Verification with TestFlight"
+          skip_upload: false
+          marketing_version: "998.$(basename \"${CIRCLE_PULL_REQUESTS}\")"
+          bundle_version: "${CIRCLE_BUILD_NUM}"
+          filters:
+            branches:
+              only:
+                - /^feature-testflight\/.+/
+
+      - test_and_upload:
+          <<: *YAMAP_PR_TESTFLIGHT_COMMON
+          name: "YAMAP PR Verification(IAP) with TestFlight"
+          scheme: "yamap (IAP develop)"
+          filters:
+            branches:
+              only:
+                - /^feature-testflight-iap\/.+/
+
+      - test_and_upload:
+          <<: *YAMAP_PR_TESTFLIGHT_COMMON
+          name: "YAMAP PR Verification(staging) with TestFlight"
+          scheme: "yamap (staging)"
+          filters:
+            branches:
+              only:
+                - /^feature-testflight-staging\/.+/
